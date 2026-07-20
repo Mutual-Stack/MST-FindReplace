@@ -38,14 +38,45 @@ param(
 # REPLACE MAP - ordered, most-specific first. Each pattern replaces the WHOLE
 # word it matches. Matching is case-insensitive. These run only on messages
 # that do NOT hit the delete list below.
+#
+# Each pattern maps to an ARRAY of replacement words. Every individual match
+# gets a RANDOM pick from that array - so one message containing the same
+# curse three times can come out as three different substitutes.
+# A single string still works too if you want a fixed replacement.
 $ReplaceMap = [ordered]@{
-    '\b\w*(?:shit|hsit)\w*\b'  = 'sassafrass'
+    # --- F-word family: conjugation-aware, ordered most-specific first ---
+    # Core stem covers: fuck, fuuuck (letter repeats), fuk, fuq, fcuk, fvck, phuck, fukc
+    '\b\w*(?:f+u+c+k+|fuk|fuq|fcuk|fvck|phuck|fukc)i+n\w*\b'  = @('fudging','freaking','flipping','fricking')
+    '\b\w*(?:f+u+c+k+|fuk|fuq|fcuk|fvck|phuck|fukc)e?d\b'     = @('fudged','freaked','flipped','fricked')
+    '\b\w*(?:f+u+c+k+|fuk|fuq|fcuk|fvck|phuck|fukc)e?rs?\b'   = @('fudger','freaker','flipper','fricker')
+    '\b\w*(?:f+u+c+k+|fuk|fuq|fcuk|fvck|phuck|fukc)\w*\b'     = @('fudge','freak','flip','frick')
+
+    # --- S-word family: conjugation-aware ---
+    # Core stem covers: shit, shiit, shyt, sh1t, hsit (transposition)
+    '\b\w*(?:s+h+[i1y]+t+|hsit)i+n\w*\b'  = @('sassafrassing','shangling','shnikeying')
+    '\b\w*(?:s+h+[i1y]+t+|hsit)y\b'       = @('crummy','janky','lousy')
+    '\b\w*(?:s+h+[i1y]+t+|hsit)\w*\b'     = @('sassafrass','shangles','shnikeys')
+
+    # --- Others: expanded G-rated pools ---
+    '\b\w*(?:retard|retart)\w*\b'   = @('cool cat','goofball','silly goose')
+    '\b\w*(?:dick|dik)\w*\b'        = @('meanie','jerkface','grouch')
+    '\b\w*(?:pussy|pussie)\w*\b'    = @('wuss','scaredy-cat','chicken')
+
+    # --- Phrase swaps (moved from the old delete list) ---
+    '\bfailure of\b'                = @('success of')
 }
 
 # DELETE LIST - if a message matches ANY of these, the WHOLE message is
 # removed (delete wins over replace).
+# DISABLED - all entries commented out; nothing gets deleted, only replaced.
 $DeleteList = @(
-    'mandy'
+    # '\bIWW\b'
+    # 'leadership'
+    # 'mandy'
+    # '\bkyle\w*'
+    # '\btom\b'        # whole word only ("tom") - will NOT match tomorrow/tomato/Tommy
+    # 'failure of'     # moved to ReplaceMap above -> 'success of'
+    # '\b\w*union\w*\b'
 )
 
 # ============================================================================
@@ -152,7 +183,10 @@ foreach ($chat in $chats) {
             $matched = @()
             foreach ($k in $ReplaceMap.Keys) {
                 if ($newHtml -match $k) { $matched += $k }
-                $newHtml = [regex]::Replace($newHtml, $k, $ReplaceMap[$k], 'IgnoreCase')
+                $subs = @($ReplaceMap[$k])   # array of candidates (single string still works)
+                # MatchEvaluator: each individual match gets its own random pick
+                $evaluator = { param($m) $subs | Get-Random }.GetNewClosure()
+                $newHtml = [regex]::Replace($newHtml, $k, $evaluator, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
             }
             if ($matched.Count -gt 0 -and $newHtml -ne $msg.body.content) {
                 $newPlain = Get-PlainText $newHtml
