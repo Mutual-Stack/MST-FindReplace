@@ -150,7 +150,14 @@ foreach ($chat in $chats) {
     $msgUri = "https://graph.microsoft.com/v1.0/me/chats/$($chat.id)/messages?`$top=50"
     $stop = $false
     while ($msgUri -and -not $stop) {
-        $page = Invoke-GraphWithRetry GET $msgUri
+        try {
+            $page = Invoke-GraphWithRetry GET $msgUri
+        } catch {
+            # Stale meeting chats etc. return 403 AclCheckFailed - skip chat, keep going
+            Write-Host "  SKIPPED CHAT (no access): $($_.Exception.Message.Split("`n")[0])" -ForegroundColor DarkYellow
+            $stats.Errors++
+            break
+        }
         foreach ($msg in $page.value) {
             if ($Since -and $msg.createdDateTime -and [datetime]$msg.createdDateTime -lt $Since) { $stop = $true; break }
             if ($msg.messageType -ne 'message' -or $msg.deletedDateTime) { continue }
