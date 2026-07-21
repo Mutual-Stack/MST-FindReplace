@@ -51,6 +51,10 @@ $ReplaceMap = [ordered]@{
     '\b\w*(?:f+u+c+k+|fuk|fuq|fcuk|fvck|phuck|fukc)e?rs?\b'   = @('fudger','freaker','flipper','fricker')
     '\b\w*(?:f+u+c+k+|fuk|fuq|fcuk|fvck|phuck|fukc)\w*\b'     = @('fudge','freak','flip','frick')
 
+    # --- D-word family: conjugation-aware, ordered most-specific first ---
+    # Core stem covers: Dick variants
+    '\b\w*(?:f+u+c+k+|dik|diq|dcik|dikc|dkci|adick)\w*\b'     = @('goober','goofball','dipsttick','dribbler')
+    
     # --- S-word family: conjugation-aware ---
     # Core stem covers: shit, shiit, shyt, sh1t, hsit (transposition)
     '\b\w*(?:s+h+[i1y]+t+|hsit)i+n\w*\b'  = @('sassafrassing','shangling','shnikeying')
