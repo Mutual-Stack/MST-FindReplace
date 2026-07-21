@@ -1,108 +1,96 @@
 <#
 .SYNOPSIS
-    Cleans YOUR OWN Microsoft Teams chat messages two ways:
-      1. REDACT  - swap matched words (e.g. profanity) for softer text
-      2. DELETE  - remove the whole message if it hits a delete term
+    Deletes YOUR OWN Microsoft Teams chat messages that match any pattern
+    in $DeletePatterns. No reposts, no edits - matched messages are
+    soft-deleted and logged. Built for cleanup of profanity (test phase)
+    and future removal of leaked licenses/passwords/keys.
 
 .IMPORTANT
-    Graph CANNOT edit the body of a message you already sent. "Redact"
-    is therefore implemented as: soft-delete the original, then POST a
-    NEW message from you containing the cleaned text. Recipients see the
-    "deleted" placeholder AND the new message. The repost:
-      - gets a NEW timestamp (shows as sent now)
-      - lands at the bottom of the chat, not the original position
-      - loses reactions/replies that were on the original
-    Soft delete is surface-only; compliance copies remain in the substrate.
-
-    Only messages YOU sent are ever touched (delegated auth + sender check).
+    - Graph cannot edit a sent message in place. Deletion is the only
+      clean server-side remediation.
+    - Soft delete is surface-only. Compliance/eDiscovery copies remain.
+      A leaked credential is STILL BURNED - rotate it regardless.
+    - Only messages YOU sent are touched (delegated auth + sender check).
+    - Recipients see the standard "This message was deleted" placeholder.
+    - The audit CSV contains the original message text unless -MaskLog is
+      used. For credential-removal runs, ALWAYS use -MaskLog and store the
+      CSV somewhere access-controlled.
 
 .REQUIREMENTS
     Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+    Run from a REGULAR PowerShell console, not ISE (WAM auth popup).
 
 .EXAMPLE
-    .\Redact-MyTeamsChatMessages.ps1 -DryRun        # ALWAYS run this first
-    .\Redact-MyTeamsChatMessages.ps1                # live (prompts for DELETE)
+    .\Remove-MyTeamsChatMessages.ps1 -DryRun                          # always first
+    .\Remove-MyTeamsChatMessages.ps1 -DryRun -Since (Get-Date).AddMonths(-6)
+    .\Remove-MyTeamsChatMessages.ps1                                  # live run
+    .\Remove-MyTeamsChatMessages.ps1 -MaskLog                         # live, secrets masked in CSV
 #>
 
 [CmdletBinding()]
 param(
     [switch]$DryRun,
-    [datetime]$Since,
-    [string]$LogPath = ".\TeamsChatRedact_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    $Since,   # accepts datetime; untyped so a null default can't break closures/binding
+    [string]$LogPath = ".\TeamsChatDelete_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 )
 
+if ($Since) { $Since = [datetime]$Since }
+
 # ============================================================================
-#  EDIT THESE TWO TABLES TO TASTE
+#  DELETE PATTERNS - message is removed if it matches ANY of these.
+#  Case-insensitive regex. Most-specific first is good hygiene but not
+#  required (any single hit deletes).
 # ============================================================================
+$DeletePatterns = @(
 
-# REPLACE MAP - ordered, most-specific first. Each pattern replaces the WHOLE
-# word it matches. Matching is case-insensitive. These run only on messages
-# that do NOT hit the delete list below.
-#
-# Each pattern maps to an ARRAY of replacement words. Every individual match
-# gets a RANDOM pick from that array - so one message containing the same
-# curse three times can come out as three different substitutes.
-# A single string still works too if you want a fixed replacement.
-$ReplaceMap = [ordered]@{
-    # --- F-word family: conjugation-aware, ordered most-specific first ---
-    # Core stem covers: fuck, fuuuck (letter repeats), fuk, fuq, fcuk, fvck, phuck, fukc
-    '\b\w*(?:f+u+c+k+|fuk|fuq|fcuk|fvck|phuck|fukc)i+n\w*\b'  = @('fudging','freaking','flipping','fricking')
-    '\b\w*(?:f+u+c+k+|fuk|fuq|fcuk|fvck|phuck|fukc)e?d\b'     = @('fudged','freaked','flipped','fricked')
-    '\b\w*(?:f+u+c+k+|fuk|fuq|fcuk|fvck|phuck|fukc)e?rs?\b'   = @('fudger','freaker','flipper','fricker')
-    '\b\w*(?:f+u+c+k+|fuk|fuq|fcuk|fvck|phuck|fukc)\w*\b'     = @('fudge','freak','flip','frick')
+    # --- TEST PHASE: professional cursing (wildcard-heavy on purpose) ---
+    '\b\w*(?:f+u+c+k+|fuk|fuq|fcuk|fvck|phuck|fukc)\w*\b'
+    '\b\w*(?:s+h+[i1y]+t+|hsit)\w*\b'
+    '\b\w*(?:retard|retart)\w*\b'
+    '\b\w*(?:pussy|pussie)\w*\b'
+    # NOTE: deliberately NOT including the bare dick/dik wildcard pattern here.
+    # \w* on both sides matches Dickson/Dickinson/Benedict etc. If you want it,
+    # use the anchored form below instead:
+    # '\b(?:dick|dik)(?:s|head|wad)?\b'
 
-    # --- D-word family: conjugation-aware, ordered most-specific first ---
-    # Core stem covers: Dick variants
-    '\b\w*(?:f+u+c+k+|dik|diq|dcik|dikc|dkci|adick)\w*\b'     = @('goober','goofball','dipsttick','dribbler')
-    
-    # --- S-word family: conjugation-aware ---
-    # Core stem covers: shit, shiit, shyt, sh1t, hsit (transposition)
-    '\b\w*(?:s+h+[i1y]+t+|hsit)i+n\w*\b'  = @('sassafrassing','shangling','shnikeying')
-    '\b\w*(?:s+h+[i1y]+t+|hsit)y\b'       = @('crummy','janky','lousy')
-    '\b\w*(?:s+h+[i1y]+t+|hsit)\w*\b'     = @('sassafrass','shangles','shnikeys')
-
-    # --- Others: expanded G-rated pools ---
-    '\b\w*(?:retard|retart)\w*\b'   = @('cool cat','goofball','silly goose')
-    '\b\w*(?:dick|dik)\w*\b'        = @('meanie','jerkface','grouch')
-    '\b\w*(?:pussy|pussie)\w*\b'    = @('wuss','scaredy-cat','chicken')
-
-    # --- Phrase swaps (moved from the old delete list) ---
-    '\bfailure of\b'                = @('success of')
-}
-
-# DELETE LIST - if a message matches ANY of these, the WHOLE message is
-# removed (delete wins over replace).
-# DISABLED - all entries commented out; nothing gets deleted, only replaced.
-$DeleteList = @(
-    # '\bIWW\b'
-    # 'leadership'
-    # 'mandy'
-    # '\bkyle\w*'
-    # '\btom\b'        # whole word only ("tom") - will NOT match tomorrow/tomato/Tommy
-    # 'failure of'     # moved to ReplaceMap above -> 'success of'
-    # '\b\w*union\w*\b'
+    # --- FUTURE PHASE: credentials/licenses (commented until needed) ---
+    # '(?i)\b(?:password|passwd|pwd)\s*[:=]\s*\S+'          # password: xxxx
+    # '(?i)\bapi[_-]?key\s*[:=]\s*\S+'                      # api_key=xxxx
+    # '\b[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}(?:-[A-Z0-9]{5})?\b'  # XXXXX-XXXXX license keys
+    # '\bAKIA[0-9A-Z]{16}\b'                                # AWS access key ID
+    # '(?i)\bbearer\s+[a-z0-9\-\._~\+\/]{20,}=*'            # bearer tokens
+    # 'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}'        # JWTs
 )
 
 # ============================================================================
 
 Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 
-Write-Host 'Connecting to Microsoft Graph (device-code sign-in as yourself)...' -ForegroundColor Cyan
-# Chat.ReadWrite covers both read + softDelete + sending a new chat message.
+Write-Host 'Connecting to Microsoft Graph (interactive sign-in as yourself)...' -ForegroundColor Cyan
 Connect-MgGraph -Scopes 'Chat.ReadWrite','User.Read' -NoWelcome
+
+# Hard guard: never reach the confirmation prompt unauthenticated
+$ctx = Get-MgContext
+if (-not $ctx -or -not $ctx.Account) { throw 'Graph auth failed - aborting before any changes.' }
 
 $me   = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/me'
 $myId = $me.id
 Write-Host "Authenticated as: $($me.displayName) <$($me.userPrincipalName)>" -ForegroundColor Green
-Write-Host "Mode: $(if ($DryRun) {'DRY RUN - nothing changes'} else {'LIVE - messages WILL be deleted/reposted'})" -ForegroundColor $(if ($DryRun) {'Yellow'} else {'Red'})
+Write-Host "Mode: $(if ($DryRun) {'DRY RUN - nothing changes'} else {'LIVE - matched messages WILL be deleted'})" -ForegroundColor $(if ($DryRun) {'Yellow'} else {'Red'})
 
 if (-not $DryRun) {
-    $confirm = Read-Host "Type DELETE to confirm the live run"
+    $confirm = Read-Host 'Type DELETE to confirm the live run'
     if ($confirm -cne 'DELETE') { Write-Host 'Aborted.'; return }
 }
 
-$results = [System.Collections.Generic.List[object]]::new()
-$stats   = @{ Chats=0; Scanned=0; Deleted=0; Redacted=0; Skipped=0; Errors=0 }
+$stats     = @{ Chats=0; Scanned=0; Deleted=0; Skipped=0; Errors=0 }
+$logHeader = $false
+
+function Write-LogEntry {
+    param($Entry)
+    # Per-entry append: a Ctrl+C can never lose history
+    $Entry | Export-Csv -Path $LogPath -NoTypeInformation -Encoding UTF8 -Append
+}
 
 function Invoke-GraphWithRetry {
     param([string]$Method,[string]$Uri,$Body)
@@ -137,6 +125,12 @@ function Get-PlainText {
     return ($t -replace '\s+',' ').Trim()
 }
 
+function Get-LoggableText {
+    param([string]$Plain, [string]$Pattern)
+    # Always mask the matched text - console and CSV never show the hit itself
+    return [regex]::Replace($Plain, $Pattern, '****', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+}
+
 # --- enumerate chats ---
 Write-Host 'Enumerating chats...' -ForegroundColor Cyan
 $chats = [System.Collections.Generic.List[object]]::new()
@@ -165,66 +159,45 @@ foreach ($chat in $chats) {
 
             $plain = Get-PlainText $msg.body.content
 
-            # 1) delete list wins
-            $delHit = $DeleteList | Where-Object { $plain -match $_ } | Select-Object -First 1
-            if ($delHit) {
-                $entry = [pscustomobject]@{
-                    Timestamp=$msg.createdDateTime; Chat=$label; Action=''; MatchedOn=$delHit
-                    Before=$plain; After='(message removed)'; ChatId=$chat.id; MessageId=$msg.id; NewMessageId=''
-                }
-                if ($DryRun) { $entry.Action='WOULD DELETE'; Write-Host "  DELETE  <= [$delHit] $($plain.Substring(0,[Math]::Min(80,$plain.Length)))" -ForegroundColor Yellow }
-                else {
-                    try {
-                        Invoke-GraphWithRetry POST "https://graph.microsoft.com/v1.0/me/chats/$($chat.id)/messages/$($msg.id)/softDelete" | Out-Null
-                        $entry.Action='DELETED'; $stats.Deleted++; Write-Host "  DELETED <= [$delHit]" -ForegroundColor Red; Start-Sleep -Milliseconds 300
-                    } catch { $entry.Action="ERROR: $($_.Exception.Message)"; $stats.Errors++ }
-                }
-                $results.Add($entry); continue
+            $hit = $DeletePatterns | Where-Object { $plain -match $_ } | Select-Object -First 1
+            if (-not $hit) { $stats.Skipped++; continue }
+
+            $logText = Get-LoggableText -Plain $plain -Pattern $hit
+            $entry = [pscustomobject]@{
+                Timestamp = $msg.createdDateTime
+                Chat      = $label
+                Action    = ''
+                MatchedOn = $hit
+                Message   = $logText
+                ChatId    = $chat.id
+                MessageId = $msg.id
             }
 
-            # 2) replace map -> if changed, delete original + repost cleaned
-            $newHtml = $msg.body.content
-            $matched = @()
-            foreach ($k in $ReplaceMap.Keys) {
-                if ($newHtml -match $k) { $matched += $k }
-                $subs = @($ReplaceMap[$k])   # array of candidates (single string still works)
-                # MatchEvaluator: each individual match gets its own random pick
-                $evaluator = { param($m) $subs | Get-Random }.GetNewClosure()
-                $newHtml = [regex]::Replace($newHtml, $k, $evaluator, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            }
-            if ($matched.Count -gt 0 -and $newHtml -ne $msg.body.content) {
-                $newPlain = Get-PlainText $newHtml
-                $entry = [pscustomobject]@{
-                    Timestamp=$msg.createdDateTime; Chat=$label; Action=''; MatchedOn=($matched -join '; ')
-                    Before=$plain; After=$newPlain; ChatId=$chat.id; MessageId=$msg.id; NewMessageId=''
-                }
-                if ($DryRun) { $entry.Action='WOULD REDACT'; Write-Host "  REDACT  '$($plain.Substring(0,[Math]::Min(60,$plain.Length)))' -> '$($newPlain.Substring(0,[Math]::Min(60,$newPlain.Length)))'" -ForegroundColor Yellow }
-                else {
-                    try {
-                        # delete original
-                        Invoke-GraphWithRetry POST "https://graph.microsoft.com/v1.0/me/chats/$($chat.id)/messages/$($msg.id)/softDelete" | Out-Null
-                        # repost cleaned
-                        $body = @{ body = @{ contentType='html'; content=$newHtml } }
-                        $new  = Invoke-GraphWithRetry POST "https://graph.microsoft.com/v1.0/me/chats/$($chat.id)/messages" $body
-                        $entry.Action='REDACTED'; $entry.NewMessageId=$new.id; $stats.Redacted++
-                        Write-Host "  REDACTED (reposted as $($new.id))" -ForegroundColor Magenta; Start-Sleep -Milliseconds 400
-                    } catch { $entry.Action="ERROR: $($_.Exception.Message)"; $stats.Errors++ }
-                }
-                $results.Add($entry)
+            if ($DryRun) {
+                $entry.Action = 'WOULD DELETE'
+                Write-Host "  DELETE  <= [$hit] $($logText.Substring(0,[Math]::Min(80,$logText.Length)))" -ForegroundColor Yellow
             } else {
-                $stats.Skipped++
+                try {
+                    Invoke-GraphWithRetry POST "https://graph.microsoft.com/v1.0/me/chats/$($chat.id)/messages/$($msg.id)/softDelete" | Out-Null
+                    $entry.Action = 'DELETED'; $stats.Deleted++
+                    Write-Host "  DELETED <= [$hit]" -ForegroundColor Red
+                    Start-Sleep -Milliseconds 300
+                } catch {
+                    $entry.Action = "ERROR: $($_.Exception.Message)"; $stats.Errors++
+                }
             }
+            Write-LogEntry $entry
         }
         $msgUri = $page.'@odata.nextLink'
     }
 }
 
-if ($results.Count -gt 0) { $results | Export-Csv $LogPath -NoTypeInformation -Encoding UTF8; Write-Host "`nAudit log: $LogPath" -ForegroundColor Green }
 Write-Host "`n===== SUMMARY =====" -ForegroundColor Cyan
 Write-Host "Chats:    $($stats.Chats)"
 Write-Host "Scanned:  $($stats.Scanned)  (my messages)"
 Write-Host "Deleted:  $($stats.Deleted)"
-Write-Host "Redacted: $($stats.Redacted)"
+Write-Host "Skipped:  $($stats.Skipped)"
 Write-Host "Errors:   $($stats.Errors)"
-if ($DryRun) { Write-Host "`nDry run complete. Open the CSV, check the Before/After columns, then re-run without -DryRun." -ForegroundColor Yellow }
+if (Test-Path $LogPath) { Write-Host "Audit log: $LogPath" -ForegroundColor Green }
+if ($DryRun) { Write-Host "`nDry run complete. Review the CSV, then re-run without -DryRun." -ForegroundColor Yellow }
 Disconnect-MgGraph | Out-Null
